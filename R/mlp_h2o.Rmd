@@ -1,0 +1,164 @@
+---
+title: "MLP Classifier"
+author: "Rick Q"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### Abstract
+
+#### Activation function
+
+$$tanh(z) = \frac{e^z - e^{-z}}{e^z + e^{-z}}$$
+
+where $z$ is the weighted linear combination of inputs $z = w^Tx + b$.
+
+```{r draw tanh curve, echo=FALSE}
+# curve(tanh, from=-5, to=5, xlab="z", ylab="tanh(z)")
+```
+
+#### Predicted output
+
+$$\hat{y} = tanh(w^Tx + b)$$
+
+
+#### Loss function
+
+$$ L(\hat{y}^{(i)}, y^{(i)}) = \frac{1}{2}(\hat{y}^{(i)} - y^{(i)})^2$$
+
+where $\hat{y}^{(i)} = tanh(w^Tx^{(i)} + b) = tanh(z^{(i)})$ for a single training example $(x^{(i)}, y^{(i)})$.
+
+#### Cost function 
+
+$$J(w,b) = \frac{1}{m}\sum_{i=1}^m L(\hat{y}^{(i)}, y^{(i)}) = \frac{1}{2m}\sum_{i=1}^m (\hat{y}^{(i)} - y^{(i)})^2$$
+
+#### Gradient descent
+
+$$w := w - \alpha \frac{\partial J(w,b)}{\partial w}$$
+$$b := b - \alpha\frac{\partial J(w,b)}{\partial b}$$
+       
+where $a$ is the learning rate.
+
+### Model Evaluation
+
+#### Initialization
+
+```{r init, results='hide', message=FALSE, warning=FALSE}
+options(scipen=999)
+library(ggplot2)
+library(mlbench)
+library(caret)
+library(h2o)
+
+h2o.init(nthreads=4, min_mem_size="5g", max_mem_size="10g")
+h2o.removeAll()
+```
+
+#### Data exploration
+
+```{r Data Exploration}
+df <- readRDS("pay_sim.rds")
+dim(df)
+head(df[,c("amount","oldbalanceOrg","isFraud")])
+summary(df[,c(3, 5, 10)])
+table(df$isFraud)
+```
+
+```{r Plot oldbalanceOrg v.s. amount }
+g <- ggplot(df, aes(x=amount , y=oldbalanceOrg)) 
+g <- g + geom_point(aes(color=isFraud))
+g
+```
+
+#### Data preparation
+
+```{r data preparation}
+# Normalize feature vectors to unit length
+normalize <- function(x) (x/sqrt(sum(x^2)))
+df$oldbalanceOrg <- normalize(df$oldbalanceOrg)
+df$amount  <- normalize(df$amount )
+
+df$isFraud <-  as.factor(df[,10])
+
+# Partition the dataset
+idx <- createDataPartition(df$isFraud, p = .6, list = FALSE)
+X_train <- df[idx,]
+
+remaining <- df[-idx,]
+idx1 <- createDataPartition(remaining$isFraud, p = .5, list = FALSE)
+X_val <- remaining[idx1,]
+X_test <- remaining[-idx1,]
+```
+
+#### Model selection
+
+```{r Model selection, warning=FALSE, results='hide'}
+# Fit the mlp model
+train_h2o <- as.h2o(X_train)
+val_h2o <- as.h2o(X_val)
+test_h2o <- as.h2o(X_test)
+
+hyper_params <- list(
+  activation=c("Rectifier","Tanh","Maxout","RectifierWithDropout","TanhWithDropout","MaxoutWithDropout"),
+  hidden=list(c(50,50), c(50,50,50),c(100,100)),
+  input_dropout_ratio=c(0,0.05),
+  l1=seq(0,1e-4,1e-6),
+  l2=seq(0,1e-4,1e-6)
+)
+
+search_criteria = list(strategy = "RandomDiscrete", 
+                       max_runtime_secs = 600, 
+                       max_models = 100, 
+                       seed=1234567, 
+                       stopping_rounds=5, 
+                       stopping_tolerance=1e-2,  
+                       stopping_metric="logloss")
+
+dl_random_grid <- h2o.grid(
+  algorithm="deeplearning",
+  grid_id = "dl_grid_random",
+  training_frame=train_h2o,
+  validation_frame=val_h2o, 
+  x = c(3,5),
+  y=10,
+  epochs=40,
+  score_validation_samples=10000, ## downsample validation set for faster scoring
+  score_duty_cycle=0.025,         ## don't score more than 2.5% of the wall time
+  max_w2=10,                      ## can help improve stability for Rectifier
+  hyper_params = hyper_params,
+  search_criteria = search_criteria
+) 
+
+```
+
+#### Best model details
+
+```{r Best model details}
+grid <- h2o.getGrid("dl_grid_random",sort_by="logloss",decreasing=FALSE)
+#grid@summary_table[1,]
+
+best_model <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest logloss
+best_model
+```
+
+#### Best model ROC
+
+```{r model details}
+plot(h2o.performance(best_model), type ="roc")
+```
+
+#### Model performance
+
+```{r perf pridict, warning=FALSE, results='hide'}
+pred = h2o.predict(best_model,test_h2o)
+pred <- as.data.frame(pred)
+```
+
+```{r confusionMatrix}
+cm <- caret::confusionMatrix(pred$predict, X_test[,10], positive='1')
+cm
+cm$byClass[7]
+```
+
